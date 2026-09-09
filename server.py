@@ -33,6 +33,7 @@ class Account:
     frozen_shares: int = 0
     is_bot: bool = False
     unlimited_funds: bool = False
+    avg_cost: float = 10.0
 
 
 @dataclass
@@ -87,7 +88,7 @@ class Market:
             # 当前公开市场的首位真人是“庄家”，拥有无限虚拟资金；其他玩家保持普通起始资金。
             founder = not any(not account.is_bot for account in self.accounts.values())
             cash = STARTING_CASH
-            self.accounts[ident] = Account(ident, clean, cash=cash, starting_equity=cash + STARTING_SHARES * self.last_price, unlimited_funds=founder)
+            self.accounts[ident] = Account(ident, clean, cash=cash, starting_equity=cash + STARTING_SHARES * self.last_price, unlimited_funds=founder, avg_cost=self.last_price)
             mission = random.choice(self.missions)
             return {"player_id": ident, "founder": founder, "mission": {"title": mission[0], "text": mission[1], "metric": mission[2]}}
 
@@ -175,7 +176,10 @@ class Market:
             else:
                 buyer.cash -= price * qty
                 buyer.frozen_cash -= price * qty
+            # 持仓成本只由实际成交更新，采用加权平均法。
+            previous_shares = buyer.shares
             buyer.shares += qty
+            buyer.avg_cost = ((previous_shares * buyer.avg_cost) + (price * qty)) / buyer.shares
             seller.shares -= qty
             seller.frozen_shares -= qty
             seller.cash += price * qty
