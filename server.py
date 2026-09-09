@@ -32,6 +32,7 @@ class Account:
     frozen_cash: float = 0.0
     frozen_shares: int = 0
     is_bot: bool = False
+    unlimited_funds: bool = False
 
 
 @dataclass
@@ -83,10 +84,10 @@ class Market:
         clean = "".join(c for c in name.strip()[:14] if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in "_- ") or "匿名投资者"
         with self.lock:
             ident = uuid.uuid4().hex[:12]
-            # 当前公开市场的首位真人是“庄家”，授予 100 亿元虚拟资金；其他玩家保持普通起始资金。
+            # 当前公开市场的首位真人是“庄家”，拥有无限虚拟资金；其他玩家保持普通起始资金。
             founder = not any(not account.is_bot for account in self.accounts.values())
-            cash = 10_000_000_000.0 if founder else STARTING_CASH
-            self.accounts[ident] = Account(ident, clean, cash=cash, starting_equity=cash + STARTING_SHARES * self.last_price)
+            cash = STARTING_CASH
+            self.accounts[ident] = Account(ident, clean, cash=cash, starting_equity=cash + STARTING_SHARES * self.last_price, unlimited_funds=founder)
             mission = random.choice(self.missions)
             return {"player_id": ident, "founder": founder, "mission": {"title": mission[0], "text": mission[1], "metric": mission[2]}}
 
@@ -97,7 +98,7 @@ class Market:
     def _remove_order(self, order: Order):
         """撤掉订单并完整释放其尚未成交的冻结资产。"""
         account = self.accounts[order.owner]
-        if order.side == "buy":
+        if order.side == "buy" and not account.unlimited_funds:
             account.frozen_cash -= order.price * order.remaining
         else:
             account.frozen_shares -= order.remaining
@@ -139,8 +140,9 @@ class Market:
             account = self.accounts[owner]
             if side == "buy":
                 required = price * qty
-                if account.cash - account.frozen_cash + 1e-7 < required: raise ValueError("可用资金不足")
-                account.frozen_cash += required
+                if not account.unlimited_funds:
+                    if account.cash - account.frozen_cash + 1e-7 < required: raise ValueError("可用资金不足")
+                    account.frozen_cash += required
             else:
                 if account.shares - account.frozen_shares < qty: raise ValueError("可用持仓不足")
                 account.frozen_shares += qty
@@ -163,9 +165,12 @@ class Market:
             price = maker.price
             buyer = self.accounts[taker.owner if taker.side == "buy" else maker.owner]
             seller = self.accounts[taker.owner if taker.side == "sell" else maker.owner]
-            buyer.frozen_cash -= (taker.price if taker.side == "buy" else maker.price) * qty if taker.side == "buy" else 0
+            if not buyer.unlimited_funds and taker.side == "buy":
+                buyer.frozen_cash -= taker.price * qty
             # Release the buyer's reserved limit amount and debit actual price.
-            if taker.side == "buy":
+            if buyer.unlimited_funds:
+                pass
+            elif taker.side == "buy":
                 buyer.cash -= price * qty
             else:
                 buyer.cash -= price * qty
@@ -209,8 +214,8 @@ class Market:
                 return out
             player = self.accounts.get(player_id or "")
             pending = [asdict(o) for o in self.orders.values() if player and o.owner == player.id]
-            equity = (player.cash + player.shares * self.last_price) if player else 0
-            return {"symbol":"ZJ001", "name":"庄家控盘", "last":self.last_price, "change":round((self.last_price / 10 - 1) * 100, 2), "open":self.open_price, "high":self.high, "low":self.low, "volume":self.volume, "limits":[LOWER_LIMIT, UPPER_LIMIT], "bids":levels(bids), "asks":levels(asks), "trades":list(self.trades), "candles":list(self.candles), "account": asdict(player) if player else None, "equity":round(equity,2), "pending":sorted(pending, key=lambda o:o["created"], reverse=True), "online":len([x for x in self.accounts.values() if not x.is_bot])}
+            equity = None if player and player.unlimited_funds else (player.cash + player.shares * self.last_price) if player else 0
+            return {"symbol":"ZJ001", "name":"庄家控盘", "last":self.last_price, "change":round((self.last_price / 10 - 1) * 100, 2), "open":self.open_price, "high":self.high, "low":self.low, "volume":self.volume, "limits":[LOWER_LIMIT, UPPER_LIMIT], "bids":levels(bids), "asks":levels(asks), "trades":list(self.trades), "candles":list(self.candles), "account": asdict(player) if player else None, "equity":round(equity,2) if equity is not None else None, "pending":sorted(pending, key=lambda o:o["created"], reverse=True), "online":len([x for x in self.accounts.values() if not x.is_bot])}
 
     def robots(self):
         with self.lock:
