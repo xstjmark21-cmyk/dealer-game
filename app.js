@@ -8,6 +8,7 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{side=b.dataset.side;
 document.querySelectorAll('.quick button').forEach(b=>b.onclick=()=>$('qty').value=b.dataset.n);
 $('price').addEventListener('input',()=>priceTouched=true);
 $('submit').onclick=async()=>{if(!playerId)return toast('请先进入市场');try{await api('/api/order',{player_id:playerId,side,price:$('price').value,qty:$('qty').value});toast('委托已提交，正在等待撮合');tick()}catch(e){toast(e.message)}};
+$('cancel-all').onclick=async()=>{if(!playerId)return toast('请先进入市场');try{const r=await api('/api/cancel-all',{player_id:playerId});toast(r.count?`已撤销 ${r.count} 笔委托`:'当前没有可撤委托');tick()}catch(e){toast(e.message)}};
 async function cancelOrder(id){try{await api('/api/cancel',{player_id:playerId,order_id:id});toast('撤单成功');tick()}catch(e){toast(e.message)}}
 $('pending').addEventListener('click',event=>{const button=event.target.closest('[data-cancel-id]');if(!button)return;button.disabled=true;cancelOrder(button.dataset.cancelId)});
 function levels(id, data, prefix, isAsk=false){let rows=[...data].slice(0,5);if(isAsk){rows.reverse();while(rows.length<5)rows.unshift(null)}else{while(rows.length<5)rows.push(null)}$(id).innerHTML=rows.map((x,i)=>{const label=isAsk?5-i:i+1;return `<div class="level"><span>${prefix}${label}</span><b class="${x?(prefix==='卖'?'green':'red'):''}">${x?x.price.toFixed(2):'--'}</b><span>${x?x.qty:'--'}</span></div>`}).join('')}

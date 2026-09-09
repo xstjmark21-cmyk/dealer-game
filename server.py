@@ -195,6 +195,14 @@ class Market:
             if not order or order.owner != owner: raise ValueError("找不到可撤委托")
             self._remove_order(order)
 
+    def cancel_all(self, owner: str):
+        with self.lock:
+            if owner not in self.accounts: raise ValueError("登录已失效，请重新进入市场")
+            orders = [order for order in self.orders.values() if order.owner == owner]
+            for order in orders:
+                self._remove_order(order)
+            return len(orders)
+
     def _update_candle(self, price, qty):
         bucket = int(time.time() // 60)
         if bucket != self.current_bucket:
@@ -313,6 +321,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(200, {"ok":True,"order_id":oid})
             if self.path == "/api/cancel":
                 MARKET.cancel(data["player_id"], data["order_id"]); return self._json(200, {"ok":True})
+            if self.path == "/api/cancel-all":
+                count = MARKET.cancel_all(data["player_id"]); return self._json(200, {"ok":True, "count":count})
             self._json(404, {"error":"not found"})
         except (ValueError, KeyError, TypeError) as e: self._json(400, {"error":str(e)})
 
