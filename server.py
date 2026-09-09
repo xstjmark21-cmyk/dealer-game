@@ -232,6 +232,13 @@ class Market:
     def robots(self):
         with self.lock:
             self._reconcile_crossed_book()
+            # 机器人是市场流动性提供者：成交后及时补回模拟库存，避免被一张大单耗尽后停市。
+            for bot_id in self.bot_ids:
+                account = self.accounts[bot_id]
+                if account.cash - account.frozen_cash < 100_000:
+                    account.cash += STARTING_CASH
+                if account.shares - account.frozen_shares < 5_000:
+                    account.shares += STARTING_SHARES * 10
             # Cancel stale bot orders to keep spreads alive and prevent book accumulation.
             for oid, order in list(self.orders.items()):
                 if order.owner.startswith("bot-") and time.time() - order.created > 15:
@@ -266,6 +273,13 @@ class Market:
                     side = "buy"
                 else:
                     side = "buy" if (price <= self.last_price or random.random() < .5) else "sell"
+                # 不让机器人卖单直接耗尽玩家的大额买墙；卖盘始终留在最佳买价上方，
+                # 其余机器人仍可用主动买入来形成真实成交。
+                if side == "sell":
+                    bids = self._book("buy")
+                    if bids:
+                        price = max(price, round(bids[0].price + TICK, 2))
+                    price = min(UPPER_LIMIT, price)
                 self._place_bot_order(bot_id, side, price, random.choice([100,200,300,500]))
             # 无论行情涨跌，保留至少五档可见的机器人流动性。
             active_bids = {o.price for o in self._book("buy")}
@@ -279,6 +293,14 @@ class Market:
                 if ask not in active_asks:
                     self._place_bot_order(self.bot_ids[i + 5], "sell", ask, 500)
                     active_asks.add(ask)
+            # 定时由另一位机器人主动吃掉一档卖盘，所有 K 线变化仍来自真实订单撮合。
+            if random.random() < .45:
+                asks = self._book("sell")
+                if asks:
+                    maker = asks[0]
+                    buyer = next((bot_id for bot_id in self.bot_ids if bot_id != maker.owner), None)
+                    if buyer:
+                        self._place_bot_order(buyer, "buy", maker.price, random.choice([100, 200, 300]))
             self._reconcile_crossed_book()
 
 
