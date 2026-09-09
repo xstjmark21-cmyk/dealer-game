@@ -19,7 +19,9 @@ ROOT = Path(__file__).parent
 STARTING_CASH = 1_000_000.0
 STARTING_SHARES = 10_000
 TICK = 0.01
-LOWER_LIMIT, UPPER_LIMIT = 9.00, 11.00
+MIN_PRICE = 0.01
+DAILY_LIMIT_RATE = 0.10
+TRADING_DAY_SECONDS = 180
 
 
 @dataclass
@@ -34,6 +36,9 @@ class Account:
     is_bot: bool = False
     unlimited_funds: bool = False
     avg_cost: float = 10.0
+    realized_pnl: float = 0.0
+    trade_count: int = 0
+    trade_volume: int = 0
 
 
 @dataclass
@@ -53,8 +58,14 @@ class Market:
         self.accounts: dict[str, Account] = {}
         self.orders: dict[str, Order] = {}
         self.trades = deque(maxlen=80)
+        self.player_trades: dict[str, deque] = {}
+        self.settlements: dict[str, deque] = {}
         self.last_price = 10.00
         self.open_price = 10.00
+        self.trading_day = 1
+        self.day_started = time.monotonic()
+        self.lower_limit = 9.00
+        self.upper_limit = 11.00
         self.high = 10.00
         self.low = 10.00
         self.volume = 0
@@ -68,6 +79,21 @@ class Market:
         ]
         self.bot_ids = []
         self._seed_bots()
+
+    def _roll_day_if_due(self):
+        """游戏内每三分钟为一个交易日，涨跌停跟随上一日收盘价重新计算。"""
+        if time.monotonic() - self.day_started < TRADING_DAY_SECONDS:
+            return
+        self.trading_day += 1
+        self.day_started = time.monotonic()
+        self.open_price = self.last_price
+        self.high = self.low = self.last_price
+        self.volume = 0
+        self.lower_limit = round(max(MIN_PRICE, self.open_price * (1 - DAILY_LIMIT_RATE)), 2)
+        self.upper_limit = round(max(MIN_PRICE, self.open_price * (1 + DAILY_LIMIT_RATE)), 2)
+        for order in list(self.orders.values()):
+            if order.owner.startswith("bot-") and not self.lower_limit <= order.price <= self.upper_limit:
+                self._remove_order(order)
 
     def _seed_bots(self):
         styles = ["北极做市", "南风做市", "追涨客", "抄底王", "量化均值", "趋势猎手", "短线游资", "稳健基金", "消息灵通", "耐心大户"]
@@ -89,6 +115,8 @@ class Market:
             founder = not any(not account.is_bot for account in self.accounts.values())
             cash = STARTING_CASH
             self.accounts[ident] = Account(ident, clean, cash=cash, starting_equity=cash + STARTING_SHARES * self.last_price, unlimited_funds=founder, avg_cost=self.last_price)
+            self.player_trades[ident] = deque(maxlen=30)
+            self.settlements[ident] = deque(maxlen=12)
             mission = random.choice(self.missions)
             return {"player_id": ident, "founder": founder, "mission": {"title": mission[0], "text": mission[1], "metric": mission[2]}}
 
@@ -134,9 +162,10 @@ class Market:
 
     def place(self, owner: str, side: str, price: float, qty: int):
         with self.lock:
+            self._roll_day_if_due()
             if owner not in self.accounts: raise ValueError("登录已失效，请重新进入市场")
             if side not in ("buy", "sell"): raise ValueError("交易方向无效")
-            if not LOWER_LIMIT <= price <= UPPER_LIMIT: raise ValueError("价格超出当日涨跌停范围")
+            if not self.lower_limit <= price <= self.upper_limit: raise ValueError(f"价格超出当日涨跌停范围（{self.lower_limit:.2f}～{self.upper_limit:.2f}）")
             if qty < 100 or qty % 100: raise ValueError("数量必须为 100 股的整数倍")
             account = self.accounts[owner]
             if side == "buy":
@@ -164,6 +193,7 @@ class Market:
                 break
             qty = min(taker.remaining, maker.remaining)
             price = maker.price
+            now = datetime.now().strftime("%H:%M:%S")
             buyer = self.accounts[taker.owner if taker.side == "buy" else maker.owner]
             seller = self.accounts[taker.owner if taker.side == "sell" else maker.owner]
             if not buyer.unlimited_funds and taker.side == "buy":
@@ -183,11 +213,16 @@ class Market:
             seller.shares -= qty
             seller.frozen_shares -= qty
             seller.cash += price * qty
+            seller.realized_pnl += (price - seller.avg_cost) * qty
+            for account, direction in ((buyer, "买入"), (seller, "卖出")):
+                account.trade_count += 1
+                account.trade_volume += qty
+                if not account.is_bot:
+                    self.player_trades[account.id].appendleft({"time": now, "side": direction, "price": price, "qty": qty})
             taker.remaining -= qty
             maker.remaining -= qty
             self.last_price = price
             self.high, self.low, self.volume = max(self.high, price), min(self.low, price), self.volume + qty
-            now = datetime.now().strftime("%H:%M:%S")
             self.trades.appendleft({"time": now, "price": price, "qty": qty, "side": taker.side})
             self._update_candle(price, qty)
             if not maker.remaining: self.orders.pop(maker.id, None)
@@ -207,6 +242,29 @@ class Market:
                 self._remove_order(order)
             return len(orders)
 
+    def _performance(self, account: Account):
+        floating = (self.last_price - account.avg_cost) * account.shares
+        pnl = account.realized_pnl + floating
+        base = max(STARTING_SHARES * account.avg_cost, 1)
+        return {"pnl": round(pnl, 2), "return_rate": round(pnl / base * 100, 2), "floating_pnl": round(floating, 2), "realized_pnl": round(account.realized_pnl, 2), "trade_count": account.trade_count, "trade_volume": account.trade_volume}
+
+    def _leaderboard(self):
+        rows = []
+        for account in self.accounts.values():
+            if account.is_bot: continue
+            performance = self._performance(account)
+            rows.append({"name": account.name, "return_rate": performance["return_rate"], "pnl": performance["pnl"], "trade_count": performance["trade_count"]})
+        return sorted(rows, key=lambda row: (row["return_rate"], row["pnl"]), reverse=True)[:8]
+
+    def settle(self, owner: str):
+        with self.lock:
+            if owner not in self.accounts: raise ValueError("登录已失效，请重新进入市场")
+            cancelled = self.cancel_all(owner)
+            account = self.accounts[owner]
+            result = {"time": datetime.now().strftime("%H:%M:%S"), "last": self.last_price, "cancelled": cancelled, **self._performance(account)}
+            self.settlements[owner].appendleft(result)
+            return result
+
     def _update_candle(self, price, qty):
         bucket = int(time.time() // 60)
         if bucket != self.current_bucket:
@@ -217,6 +275,7 @@ class Market:
 
     def snapshot(self, player_id: str | None):
         with self.lock:
+            self._roll_day_if_due()
             bids, asks = self._book("buy"), self._book("sell")
             def levels(items):
                 out = []
@@ -227,10 +286,11 @@ class Market:
             player = self.accounts.get(player_id or "")
             pending = [asdict(o) for o in self.orders.values() if player and o.owner == player.id]
             equity = None if player and player.unlimited_funds else (player.cash + player.shares * self.last_price) if player else 0
-            return {"symbol":"ZJ001", "name":"庄家控盘", "last":self.last_price, "change":round((self.last_price / 10 - 1) * 100, 2), "open":self.open_price, "high":self.high, "low":self.low, "volume":self.volume, "limits":[LOWER_LIMIT, UPPER_LIMIT], "bids":levels(bids), "asks":levels(asks), "trades":list(self.trades), "candles":list(self.candles), "account": asdict(player) if player else None, "equity":round(equity,2) if equity is not None else None, "pending":sorted(pending, key=lambda o:o["created"], reverse=True), "online":len([x for x in self.accounts.values() if not x.is_bot])}
+            return {"symbol":"ZJ001", "name":"庄家控盘", "last":self.last_price, "change":round((self.last_price / self.open_price - 1) * 100, 2), "open":self.open_price, "high":self.high, "low":self.low, "volume":self.volume, "limits":[self.lower_limit, self.upper_limit], "trading_day":self.trading_day, "bids":levels(bids), "asks":levels(asks), "trades":list(self.trades), "candles":list(self.candles), "account": asdict(player) if player else None, "equity":round(equity,2) if equity is not None else None, "pending":sorted(pending, key=lambda o:o["created"], reverse=True), "online":len([x for x in self.accounts.values() if not x.is_bot]), "leaderboard":self._leaderboard(), "performance":self._performance(player) if player else None, "history":list(self.player_trades.get(player.id, ())) if player else [], "settlements":list(self.settlements.get(player.id, ())) if player else []}
 
     def robots(self):
         with self.lock:
+            self._roll_day_if_due()
             self._reconcile_crossed_book()
             # 机器人是市场流动性提供者：成交后及时补回模拟库存，避免被一张大单耗尽后停市。
             for bot_id in self.bot_ids:
@@ -249,8 +309,8 @@ class Market:
             # 涨跌停时不让机器人在同一极限价持续堆出会立刻吃掉卖盘/买盘的订单。
             for oid, order in list(self.orders.items()):
                 if not order.owner.startswith("bot-"): continue
-                locked_buy = self.last_price >= UPPER_LIMIT and order.side == "buy" and order.price >= UPPER_LIMIT
-                locked_sell = self.last_price <= LOWER_LIMIT and order.side == "sell" and order.price <= LOWER_LIMIT
+                locked_buy = self.last_price >= self.upper_limit and order.side == "buy" and order.price >= self.upper_limit
+                locked_sell = self.last_price <= self.lower_limit and order.side == "sell" and order.price <= self.lower_limit
                 if locked_buy or locked_sell:
                     acct = self.accounts[order.owner]
                     if order.side == "buy": acct.frozen_cash -= order.price * order.remaining
@@ -259,17 +319,17 @@ class Market:
             for i, bot_id in enumerate(self.bot_ids):
                 if random.random() > .82: continue
                 bias = (-1 if i in (3,4,7) else 1 if i in (2,5,6) else 0)
-                price = round(max(LOWER_LIMIT, min(UPPER_LIMIT, self.last_price + (random.choice([-2,-1,1,2]) + bias) * TICK)), 2)
+                price = round(max(self.lower_limit, min(self.upper_limit, self.last_price + (random.choice([-2,-1,1,2]) + bias) * TICK)), 2)
                 # 接近极端价格时由均值回归机器人主动向反方向成交，防止市场长期钉死涨停/跌停。
-                if self.last_price >= 10.40:
+                if self.last_price >= self.open_price * 1.04:
                     side = "sell"
-                    price = round(max(LOWER_LIMIT, self.last_price - random.choice([.01, .02, .03])), 2)
-                elif self.last_price <= 9.60:
+                    price = round(max(self.lower_limit, self.last_price - random.choice([.01, .02, .03])), 2)
+                elif self.last_price <= max(MIN_PRICE, self.open_price * .96):
                     side = "buy"
-                    price = round(min(UPPER_LIMIT, self.last_price + random.choice([.01, .02, .03])), 2)
-                elif price >= UPPER_LIMIT:
+                    price = round(min(self.upper_limit, self.last_price + random.choice([.01, .02, .03])), 2)
+                elif price >= self.upper_limit:
                     side = "sell"
-                elif price <= LOWER_LIMIT:
+                elif price <= self.lower_limit:
                     side = "buy"
                 else:
                     side = "buy" if (price <= self.last_price or random.random() < .5) else "sell"
@@ -279,14 +339,14 @@ class Market:
                     bids = self._book("buy")
                     if bids:
                         price = max(price, round(bids[0].price + TICK, 2))
-                    price = min(UPPER_LIMIT, price)
+                    price = min(self.upper_limit, price)
                 self._place_bot_order(bot_id, side, price, random.choice([100,200,300,500]))
             # 无论行情涨跌，保留至少五档可见的机器人流动性。
             active_bids = {o.price for o in self._book("buy")}
             active_asks = {o.price for o in self._book("sell")}
             for i in range(5):
-                bid = round(max(LOWER_LIMIT, self.last_price - (i + 1) * TICK), 2)
-                ask = round(min(UPPER_LIMIT, self.last_price + (i + 1) * TICK), 2)
+                bid = round(max(self.lower_limit, self.last_price - (i + 1) * TICK), 2)
+                ask = round(min(self.upper_limit, self.last_price + (i + 1) * TICK), 2)
                 if bid not in active_bids:
                     self._place_bot_order(self.bot_ids[i], "buy", bid, 500)
                     active_bids.add(bid)
@@ -349,6 +409,8 @@ class Handler(SimpleHTTPRequestHandler):
                 MARKET.cancel(data["player_id"], data["order_id"]); return self._json(200, {"ok":True})
             if self.path == "/api/cancel-all":
                 count = MARKET.cancel_all(data["player_id"]); return self._json(200, {"ok":True, "count":count})
+            if self.path == "/api/settle":
+                return self._json(200, {"ok":True, "result":MARKET.settle(data["player_id"])})
             self._json(404, {"error":"not found"})
         except (ValueError, KeyError, TypeError) as e: self._json(400, {"error":str(e)})
 
