@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import random
+import re
 import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +24,12 @@ TICK = 0.01
 MIN_PRICE = 0.01
 DAILY_LIMIT_RATE = 0.10
 TRADING_DAY_SECONDS = 180
+SESSION_TTL_SECONDS = 8 * 60 * 60
+MAX_ORDER_QTY = 10_000_000
+MAX_NAME_LENGTH = 40
+MAX_BODY_BYTES = 4 * 1024
+MAX_RATE_BUCKETS = 4096
+PLAYER_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 @dataclass
@@ -39,6 +47,7 @@ class Account:
     realized_pnl: float = 0.0
     trade_count: int = 0
     trade_volume: int = 0
+    last_seen: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -108,9 +117,11 @@ class Market:
             self._place_bot_order(self.bot_ids[i + 5], "sell", round(10.01 + i * .02, 2), 500)
 
     def join(self, name: str):
+        if not isinstance(name, str): raise ValueError("昵称格式无效")
+        if len(name) > MAX_NAME_LENGTH: raise ValueError("昵称过长")
         clean = "".join(c for c in name.strip()[:14] if c.isalnum() or '\u4e00' <= c <= '\u9fff' or c in "_- ") or "匿名投资者"
         with self.lock:
-            ident = uuid.uuid4().hex[:12]
+            ident = uuid.uuid4().hex
             # 当前公开市场的首位真人是“庄家”，拥有无限虚拟资金；其他玩家保持普通起始资金。
             founder = not any(not account.is_bot for account in self.accounts.values())
             cash = STARTING_CASH
@@ -120,6 +131,23 @@ class Market:
             mission = random.choice(self.missions)
             return {"player_id": ident, "founder": founder, "mission": {"title": mission[0], "text": mission[1], "metric": mission[2]}}
 
+    def _active_account(self, owner: str):
+        """玩家 ID 是内存会话令牌；机器人和过期会话不能调用玩家接口。"""
+        if not isinstance(owner, str) or not PLAYER_ID_RE.fullmatch(owner):
+            raise ValueError("登录已失效，请重新进入市场")
+        account = self.accounts.get(owner)
+        if not account or account.is_bot:
+            raise ValueError("登录已失效，请重新进入市场")
+        if time.monotonic() - account.last_seen > SESSION_TTL_SECONDS:
+            self._cancel_account_orders(account.id)
+            raise ValueError("登录已过期，请重新进入市场")
+        account.last_seen = time.monotonic()
+        return account
+
+    def _cancel_account_orders(self, owner: str):
+        for order in [order for order in self.orders.values() if order.owner == owner]:
+            self._remove_order(order)
+
     def _book(self, side: str):
         data = [o for o in self.orders.values() if o.side == side and o.remaining]
         return sorted(data, key=lambda o: ((-o.price if side == "buy" else o.price), o.created))
@@ -127,8 +155,9 @@ class Market:
     def _remove_order(self, order: Order):
         """撤掉订单并完整释放其尚未成交的冻结资产。"""
         account = self.accounts[order.owner]
-        if order.side == "buy" and not account.unlimited_funds:
-            account.frozen_cash -= order.price * order.remaining
+        if order.side == "buy":
+            if not account.unlimited_funds:
+                account.frozen_cash -= order.price * order.remaining
         else:
             account.frozen_shares -= order.remaining
         order.remaining = 0
@@ -163,11 +192,11 @@ class Market:
     def place(self, owner: str, side: str, price: float, qty: int):
         with self.lock:
             self._roll_day_if_due()
-            if owner not in self.accounts: raise ValueError("登录已失效，请重新进入市场")
+            account = self._active_account(owner)
             if side not in ("buy", "sell"): raise ValueError("交易方向无效")
+            if not math.isfinite(price) or abs(price / TICK - round(price / TICK)) > 1e-7: raise ValueError("价格必须按 0.01 元递增")
             if not self.lower_limit <= price <= self.upper_limit: raise ValueError(f"价格超出当日涨跌停范围（{self.lower_limit:.2f}～{self.upper_limit:.2f}）")
-            if qty < 100 or qty % 100: raise ValueError("数量必须为 100 股的整数倍")
-            account = self.accounts[owner]
+            if isinstance(qty, bool) or qty < 100 or qty > MAX_ORDER_QTY or qty % 100: raise ValueError(f"数量必须为 100 股的整数倍，且不超过 {MAX_ORDER_QTY:,} 股")
             if side == "buy":
                 required = price * qty
                 if not account.unlimited_funds:
@@ -230,16 +259,16 @@ class Market:
 
     def cancel(self, owner: str, order_id: str):
         with self.lock:
+            self._active_account(owner)
             order = self.orders.get(order_id)
             if not order or order.owner != owner: raise ValueError("找不到可撤委托")
             self._remove_order(order)
 
     def cancel_all(self, owner: str):
         with self.lock:
-            if owner not in self.accounts: raise ValueError("登录已失效，请重新进入市场")
+            self._active_account(owner)
             orders = [order for order in self.orders.values() if order.owner == owner]
-            for order in orders:
-                self._remove_order(order)
+            self._cancel_account_orders(owner)
             return len(orders)
 
     def _performance(self, account: Account):
@@ -258,7 +287,7 @@ class Market:
 
     def settle(self, owner: str):
         with self.lock:
-            if owner not in self.accounts: raise ValueError("登录已失效，请重新进入市场")
+            self._active_account(owner)
             cancelled = self.cancel_all(owner)
             account = self.accounts[owner]
             result = {"time": datetime.now().strftime("%H:%M:%S"), "last": self.last_price, "cancelled": cancelled, **self._performance(account)}
@@ -283,7 +312,11 @@ class Market:
                     if out and out[-1]["price"] == o.price: out[-1]["qty"] += o.remaining
                     elif len(out) < 5: out.append({"price": o.price, "qty": o.remaining})
                 return out
-            player = self.accounts.get(player_id or "")
+            player = self.accounts.get(player_id or "") if isinstance(player_id, str) and PLAYER_ID_RE.fullmatch(player_id) else None
+            if player and (player.is_bot or time.monotonic() - player.last_seen > SESSION_TTL_SECONDS):
+                if player and not player.is_bot: self._cancel_account_orders(player.id)
+                player = None
+            elif player: player.last_seen = time.monotonic()
             pending = [asdict(o) for o in self.orders.values() if player and o.owner == player.id]
             equity = None if player and player.unlimited_funds else (player.cash + player.shares * self.last_price) if player else 0
             return {"symbol":"ZJ001", "name":"庄家控盘", "last":self.last_price, "change":round((self.last_price / self.open_price - 1) * 100, 2), "open":self.open_price, "high":self.high, "low":self.low, "volume":self.volume, "limits":[self.lower_limit, self.upper_limit], "trading_day":self.trading_day, "bids":levels(bids), "asks":levels(asks), "trades":list(self.trades), "candles":list(self.candles), "account": asdict(player) if player else None, "equity":round(equity,2) if equity is not None else None, "pending":sorted(pending, key=lambda o:o["created"], reverse=True), "online":len([x for x in self.accounts.values() if not x.is_bot]), "leaderboard":self._leaderboard(), "performance":self._performance(player) if player else None, "history":list(self.player_trades.get(player.id, ())) if player else [], "settlements":list(self.settlements.get(player.id, ())) if player else []}
@@ -373,6 +406,16 @@ def robot_loop():
 
 
 class Handler(SimpleHTTPRequestHandler):
+    server_version = "DealerGame"
+    sys_version = ""
+    rate_lock = threading.Lock()
+    rate_buckets: dict[tuple[str, str], deque] = {}
+    rate_limits = {"snapshot": (180, 30), "post": (40, 30)}
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(5)
+
     def log_message(self, fmt, *args):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {fmt % args}")
 
@@ -380,19 +423,59 @@ class Handler(SimpleHTTPRequestHandler):
         # 开发阶段每次打开手机页面都获取最新界面，避免 Safari 缓存旧脚本。
         if self.path.endswith((".html", ".css", ".js")):
             self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Referrer-Policy", "same-origin")
         super().end_headers()
 
     def _json(self, status, body):
         raw = json.dumps(body, ensure_ascii=False).encode()
-        self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        try:
+            self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _body(self):
-        size = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(size) or b"{}")
+        try: size = int(self.headers.get("Content-Length", "0"))
+        except ValueError: raise ValueError("请求长度无效")
+        if size < 0: raise ValueError("请求长度无效")
+        if size > MAX_BODY_BYTES: raise OverflowError("请求内容过大")
+        content_type = self.headers.get("Content-Type", "")
+        if content_type and not content_type.lower().startswith("application/json"):
+            raise ValueError("请求类型必须为 JSON")
+        try: body = json.loads(self.rfile.read(size) or b"{}")
+        except json.JSONDecodeError: raise ValueError("JSON 格式无效")
+        if not isinstance(body, dict): raise ValueError("JSON 根节点必须是对象")
+        return body
+
+    def _client_ip(self):
+        # 公开部署由本机 Nginx 反代；仅在回环来源时采纳其设置的真实客户端 IP。
+        if self.client_address[0] in ("127.0.0.1", "::1"):
+            real_ip = self.headers.get("X-Real-IP", "").strip()
+            if real_ip and len(real_ip) <= 64: return real_ip
+        return self.client_address[0]
+
+    def _rate_allowed(self, scope):
+        limit, window = self.rate_limits[scope]
+        now = time.monotonic()
+        key = (self._client_ip(), scope)
+        with self.rate_lock:
+            if key not in self.rate_buckets and len(self.rate_buckets) >= MAX_RATE_BUCKETS:
+                for stale_key, stale_bucket in list(self.rate_buckets.items()):
+                    if not stale_bucket or now - stale_bucket[-1] >= window:
+                        self.rate_buckets.pop(stale_key, None)
+                while len(self.rate_buckets) >= MAX_RATE_BUCKETS:
+                    self.rate_buckets.pop(next(iter(self.rate_buckets)))
+            bucket = self.rate_buckets.setdefault(key, deque())
+            while bucket and now - bucket[0] >= window: bucket.popleft()
+            if len(bucket) >= limit: return False
+            bucket.append(now)
+            return True
 
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/snapshot":
+            if not self._rate_allowed("snapshot"): return self._json(429, {"error":"请求过于频繁，请稍后再试"})
             return self._json(200, MARKET.snapshot(parse_qs(parsed.query).get("player_id", [None])[0]))
         if parsed.path == "/api/health": return self._json(200, {"ok":True, "market":"open"})
         if parsed.path == "/": self.path = "/index.html"
@@ -400,18 +483,23 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if not self._rate_allowed("post"): return self._json(429, {"error":"请求过于频繁，请稍后再试"})
             data = self._body()
-            if self.path == "/api/join": return self._json(200, MARKET.join(str(data.get("name", ""))))
-            if self.path == "/api/order":
+            path = urlparse(self.path).path
+            if path == "/api/join": return self._json(200, MARKET.join(data.get("name", "")))
+            if path == "/api/order":
                 oid = MARKET.place(data["player_id"], data["side"], float(data["price"]), int(data["qty"]))
                 return self._json(200, {"ok":True,"order_id":oid})
-            if self.path == "/api/cancel":
+            if path == "/api/cancel":
                 MARKET.cancel(data["player_id"], data["order_id"]); return self._json(200, {"ok":True})
-            if self.path == "/api/cancel-all":
+            if path == "/api/cancel-all":
                 count = MARKET.cancel_all(data["player_id"]); return self._json(200, {"ok":True, "count":count})
-            if self.path == "/api/settle":
+            if path == "/api/settle":
                 return self._json(200, {"ok":True, "result":MARKET.settle(data["player_id"])})
             self._json(404, {"error":"not found"})
+        except OverflowError as e: self._json(413, {"error":str(e)})
+        except TimeoutError: self._json(408, {"error":"请求超时"})
+        except (BrokenPipeError, ConnectionResetError): pass
         except (ValueError, KeyError, TypeError) as e: self._json(400, {"error":str(e)})
 
 
